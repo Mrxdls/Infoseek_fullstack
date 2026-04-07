@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+.venv/
+venv/
+env/
+
+# Environment
+.env
+*.env.local
+credentials/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+test.db
+
+# Alembic
+alembic/versions/*.py
+
+# Node
+node_modules/
+frontend/build/
+frontend/.env.local
+*.log
+npm-debug.log*
+
+# Docker
+*.pid
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# question_papers
+question_papers/
+*.pdf
+cloud-sql-proxy
+*.zip
+.claude/
+gen-lang-client-*.json
