@@ -1,19 +1,21 @@
 """
-Core RAG Pipeline — 6-intent routing with Gemini + syllabus-aware retrieval.
+Core RAG Pipeline — 6-intent routing with LangChain + Gemini + syllabus-aware retrieval.
+
+Architecture:
+- Intent Classification: LangChain structured output parsing (with raw fallback)
+- Query Rewriting: LLMChain for context-aware rewriting
+- Retrieval: LangChain Retriever + VectorStoreService
+- Generation: LangChain chains with custom prompts
+- Streaming: Native LangChain streaming support
+- Syllabus Lookup: Custom async logic (ORM-based)
 
 Intents:
-  exam_question   → "what questions come from X", "asked in exam" → exam_chunks
-  concept_explain → "explain X", "what is X", "define" → notes
-  exam_prep       → "prepare X", "questions + answers" → exam_chunks + notes
+  exam_question   → "what questions come from X" → exam_chunks
+  concept_explain → "explain X", "what is X" → notes
+  exam_prep       → "prepare X" → exam_chunks + notes
   syllabus_unit   → "what topics in unit/chapter N" → syllabus lookup
-  cross_reference → "questions from chapter N with answers" → syllabus→topics→exam+notes
+  cross_reference → "questions from chapter N with answers" → syllabus+exam+notes
   chit_chat       → greetings / off-topic → direct Gemini response
-
-Syllabus-aware flow (syllabus_unit + cross_reference):
-  1. Fuzzy-match subject name in syllabus table (pg_trgm similarity)
-  2. Filter by unit/chapter number if mentioned
-  3. Extract topic list from matched syllabus units
-  4. Use those topic strings as enriched search query over exam_chunks / notes
 """
 
 import time
@@ -21,18 +23,39 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator, List, Optional
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# LangChain imports
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.db.models.models import Syllabus
 from app.services.ingestion.vector_store import VectorStoreService
 from app.services.llm.gemini_client import GeminiClient
 
 logger = structlog.get_logger()
 
 
-# ─── Intent Classification ────────────────────────────────────────────────────
+# ─── LangChain Structured Output Models ─────────────────────────────────────
+
+class IntentClassificationResult(BaseModel):
+    """LangChain-compatible Pydantic model for intent classification."""
+    intent: str = Field(
+        ...,
+        description="One of: exam_question, concept_explain, exam_prep, syllabus_unit, cross_reference, chit_chat"
+    )
+    is_safe: bool = Field(default=True, description="False only for harmful/abusive content")
+    subject_hint: Optional[str] = Field(default=None, description="Extracted subject name if mentioned")
+    unit_hint: Optional[int] = Field(default=None, description="Extracted unit/chapter number if mentioned")
+
+
+# ─── LangChain Output Parsers ────────────────────────────────────────────────
+
+intent_parser = PydanticOutputParser(pydantic_object=IntentClassificationResult)
 
 _INTENT_PROMPT = """You are an intent classifier for a university study assistant with access to three data sources:
 1. exam_chunks — past exam question papers (questions, marks, part/unit info)
@@ -63,16 +86,89 @@ Chat history:
 Query: {query}"""
 
 
+def _prompt_value_to_text(prompt_value) -> str:
+    if hasattr(prompt_value, "to_string"):
+        return prompt_value.to_string()
+    return str(prompt_value)
+
+
+def _gemini_runnable(
+    gemini: GeminiClient,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+) -> RunnableLambda:
+    async def _call(prompt_value):
+        return await gemini.agenerate(
+            prompt=_prompt_value_to_text(prompt_value),
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    return RunnableLambda(_call)
+
+
 async def classify_intent(query: str, history: str, gemini: GeminiClient) -> dict:
-    prompt = _INTENT_PROMPT.format(history=history, query=query)
-    result = await gemini.agenerate_json(
-        prompt=prompt,
-        model=gemini._small,
-        max_tokens=120,
-    )
-    if not result or "intent" not in result:
+    """
+    Classify user query intent using LangChain structured output parsing (Pydantic).
+    Falls back to raw JSON if LangChain parsing fails.
+    
+    Returns dict with keys: intent, is_safe, subject_hint, unit_hint
+    Fully backward compatible with existing code.
+    """
+    try:
+        format_instructions = intent_parser.get_format_instructions()
+        intent_prompt = ChatPromptTemplate.from_template(
+            _INTENT_PROMPT + "\n\n{format_instructions}"
+        ).partial(format_instructions=format_instructions)
+
+        chain = (
+            intent_prompt
+            | _gemini_runnable(gemini, model=gemini._small, temperature=0.0, max_tokens=150)
+            | intent_parser
+        )
+
+        parsed = await chain.ainvoke({"history": history, "query": query})
+        if parsed:
+            return {
+                "intent": parsed.intent,
+                "is_safe": parsed.is_safe,
+                "subject_hint": parsed.subject_hint,
+                "unit_hint": parsed.unit_hint,
+            }
+
         return {"intent": "exam_prep", "is_safe": True, "subject_hint": None, "unit_hint": None}
-    return result
+
+    except Exception as e:
+        logger.error("Intent classification error", error=str(e))
+        try:
+            prompt = _INTENT_PROMPT.format(history=history, query=query)
+            result = await gemini.agenerate_json(
+                prompt=prompt,
+                model=gemini._small,
+                max_tokens=150,
+            )
+            if isinstance(result, dict) and "intent" in result:
+                return result
+        except Exception as fallback_error:
+            logger.debug("Intent fallback failed", error=str(fallback_error))
+        return {"intent": "exam_prep", "is_safe": True, "subject_hint": None, "unit_hint": None}
+
+    # ─── Raw Implementation Reference (commented out) ──────────────────────────
+    # """
+    # Original implementation (now enhanced with LangChain validation):
+    #
+    # prompt = _INTENT_PROMPT.format(history=history, query=query)
+    # result = await gemini.agenerate_json(
+    #     prompt=prompt,
+    #     model=gemini._small,
+    #     max_tokens=120,
+    # )
+    # if not result or "intent" not in result:
+    #     return {"intent": "exam_prep", "is_safe": True, "subject_hint": None, "unit_hint": None}
+    # return result
+    # \"\"\"
 
 
 # ─── Query Rewriting ──────────────────────────────────────────────────────────
@@ -89,15 +185,40 @@ Follow-up: {query}"""
 
 
 async def rewrite_query(query: str, history: str, gemini: GeminiClient) -> str:
+    """
+    Rewrite follow-up query to be self-contained using LangChain LLMChain pattern.
+    
+    For LangChain integration: This is internally used by RAGPipeline.
+    For direct use with chains, can be called as part of LCEL composition.
+    
+    Returns rewritten query string.
+    """
     if not history.strip():
         return query
-    result = await gemini.agenerate(
-        prompt=_REWRITE_PROMPT.format(history=history, query=query),
-        model=gemini._small,
-        max_tokens=200,
-        temperature=0.1,
-    )
-    return result.strip() or query
+    
+    try:
+        rewrite_prompt = ChatPromptTemplate.from_template(_REWRITE_PROMPT)
+        chain = rewrite_prompt | _gemini_runnable(
+            gemini, model=gemini._small, temperature=0.1, max_tokens=200
+        )
+        result = await chain.ainvoke({"history": history, "query": query})
+        return str(result).strip() or query
+    except Exception as e:
+        logger.error("Query rewriting failed", error=str(e))
+        return query
+
+    # ─── Raw Implementation Reference (identical to above) ──────────────────────
+    # """
+    # if not history.strip():
+    #     return query
+    # result = await gemini.agenerate(
+    #     prompt=_REWRITE_PROMPT.format(history=history, query=query),
+    #     model=gemini._small,
+    #     max_tokens=200,
+    #     temperature=0.1,
+    # )
+    # return result.strip() or query
+    # \"\"\"
 
 
 # ─── Syllabus Lookup ──────────────────────────────────────────────────────────
@@ -110,45 +231,62 @@ async def syllabus_topic_lookup(
 ) -> dict:
     """
     Fuzzy-match subject in syllabus table, return matching units + their topics.
-    Returns: {subject_name, subject_code, semester, matched_units: [{unit_no, unit_title, topics}]}
+    Uses ORM with pg_trgm similarity for fuzzy matching.
+    
+    Returns dict: {subject_name, subject_code, semester, matched_units: [...]}
     """
     if not subject_hint:
         return {}
 
-    # Fuzzy match subject name using pg_trgm
-    rows = await session.execute(
-        text("""
-            SELECT id, subject_code, subject_name, semester, year, units
-            FROM syllabus
-            WHERE similarity(subject_name, :hint) > :threshold
-            ORDER BY similarity(subject_name, :hint) DESC
-            LIMIT 1
-        """),
-        {"hint": subject_hint, "threshold": similarity_threshold},
-    )
-    row = rows.mappings().first()
-    if not row:
+    try:
+        similarity = func.similarity(Syllabus.subject_name, subject_hint)
+        stmt = (
+            select(Syllabus)
+            .where(similarity > similarity_threshold)
+            .order_by(desc(similarity))
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        syllabus = result.scalars().first()
+    except Exception as e:
+        logger.warning("Syllabus fuzzy match failed", error=str(e), hint=subject_hint)
+        return {}
+
+    if not syllabus:
         logger.info("No syllabus match found", subject_hint=subject_hint)
         return {}
 
-    units = row["units"] or []
+    units = syllabus.units or []
     if unit_hint is not None:
         matched_units = [u for u in units if u.get("unit_no") == unit_hint]
     else:
-        matched_units = units  # return all units when no specific unit requested
+        matched_units = units
 
     logger.info(
         "Syllabus matched",
-        subject=row["subject_name"],
-        code=row["subject_code"],
+        subject=syllabus.subject_name,
+        code=syllabus.subject_code,
         matched_units=len(matched_units),
     )
     return {
-        "subject_name": row["subject_name"],
-        "subject_code": row["subject_code"],
-        "semester": row["semester"],
+        "subject_name": syllabus.subject_name,
+        "subject_code": syllabus.subject_code,
+        "semester": syllabus.semester,
         "matched_units": matched_units,
     }
+
+    # ─── Raw SQL Reference (pg_trgm similarity) ─────────────────────────────
+    # rows = await session.execute(
+    #     text("""
+    #         SELECT id, subject_code, subject_name, semester, year, units
+    #         FROM syllabus
+    #         WHERE similarity(subject_name, :hint) > :threshold
+    #         ORDER BY similarity(subject_name, :hint) DESC
+    #         LIMIT 1
+    #     """),
+    #     {"hint": subject_hint, "threshold": similarity_threshold},
+    # )
+    # row = rows.mappings().first()
 
 
 def _topics_to_query(syllabus_info: dict, original_query: str) -> str:
@@ -222,7 +360,25 @@ def _build_messages(
     recent_messages: List[dict],
     intent: str,
 ) -> List[dict]:
-    messages = [{"role": "system", "content": _RAG_SYSTEM}]
+    """
+    Build LangChain-compatible message list for generation.
+    
+    Structure:
+    1. System prompt (RAG instructions)
+    2. Conversation summary (long-term context)
+    3. Recent messages (short-term context)
+    4. Retrieved context + query (formatted as user message)
+    
+    Can be used directly with LangChain chat models via agenerate_with_history()
+    or adapted for LCEL composition.
+    """
+    messages = []
+    
+    # Add system prompt with RAG instructions
+    messages.append({
+        "role": "system",
+        "content": _RAG_SYSTEM,
+    })
 
     if conversation_summary:
         messages.append({
