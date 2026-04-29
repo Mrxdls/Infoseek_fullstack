@@ -1,9 +1,9 @@
 """
-Chunking strategies.
+Chunking strategies — LangChain-based text splitting.
 
-- NotesChunker: structure-aware chunking for lecture notes
+- NotesChunker: structure-aware chunking using LangChain RecursiveCharacterTextSplitter
 - ExamChunker: wraps ExamProcessor output into Chunk objects (one chunk per question)
-- OCRAdaptedChunker: smaller chunks + higher overlap for OCR-derived text
+- OCRAdaptedChunker: smaller chunks + higher overlap for OCR-derived text (LangChain-based)
 """
 
 import re
@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import structlog
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 from app.core.config import settings
 from app.db.models.models import DocumentType
@@ -35,38 +36,45 @@ class Chunk:
 
 
 class BaseChunker:
+    """Base chunker using LangChain RecursiveCharacterTextSplitter."""
+
     def __init__(self, chunk_size: int = None, overlap: int = None):
         self.chunk_size = chunk_size or settings.CHUNK_SIZE
         self.overlap = overlap or settings.CHUNK_OVERLAP
+        self._splitter = None
 
-    def _split_by_tokens(self, text: str) -> List[str]:
-        """Rough token-aware splitting (1 token ≈ 4 chars)."""
-        words = text.split()
-        chunks, current, count = [], [], 0
+    @property
+    def splitter(self) -> RecursiveCharacterTextSplitter:
+        """Lazy-initialize LangChain text splitter."""
+        if self._splitter is None:
+            self._splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.overlap,
+                separators=["\n\n", "\n", " ", ""],  # Default priority order
+                length_function=len,
+            )
+        return self._splitter
 
-        for word in words:
-            word_len = len(word) // 4 + 1
-            if count + word_len > self.chunk_size and current:
-                chunks.append(" ".join(current))
-                overlap_words = current[-(self.overlap // 4):]
-                current = overlap_words + [word]
-                count = sum(len(w) // 4 + 1 for w in current)
-            else:
-                current.append(word)
-                count += word_len
+    def _split_text(self, text: str, separators: list = None) -> List[str]:
+        """Split text using LangChain splitter with optional custom separators."""
+        if separators:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.overlap,
+                separators=separators,
+                length_function=len,
+            )
+        else:
+            splitter = self.splitter
 
-        if current:
-            chunks.append(" ".join(current))
-        return chunks
+        return splitter.split_text(text)
 
 
 class NotesChunker(BaseChunker):
     """
-    Structure-aware chunking for lecture notes.
-    Respects headings and paragraphs as natural boundaries.
+    Structure-aware chunking for lecture notes using LangChain RecursiveCharacterTextSplitter.
+    Respects headings, paragraphs, and line breaks as natural boundaries.
     """
-
-    _HEADING_RE = re.compile(r"^(#{1,6}\s.+|[A-Z][A-Z\s]{5,}:?)$", re.MULTILINE)
 
     def chunk(
         self,
@@ -75,28 +83,41 @@ class NotesChunker(BaseChunker):
         subject_name: Optional[str] = None,
         subject_code: Optional[str] = None,
     ) -> List[Chunk]:
-        sections = self._HEADING_RE.split(text)
+        """
+        Chunk notes using LangChain splitter with structure-aware separators.
+        Priority: Paragraphs → Lines → Words → Characters
+        """
+        # Structure-aware separators for notes (heading patterns included)
+        separators = [
+            "\n\n",                              # Paragraphs (primary)
+            "(?:^|\n)#{1,6}\s+.+$",              # Markdown headers (via regex)
+            "\n",                                # Lines
+            " ",                                 # Words
+            "",                                  # Characters
+        ]
+
+        # Use LangChain splitter with structure-aware separators
+        text_chunks = self._split_text(text, separators=separators)
+
+        # Convert to Chunk objects
         chunks = []
-        idx = 0
+        for idx, chunk_text in enumerate(text_chunks):
+            if chunk_text.strip():
+                chunks.append(Chunk(
+                    chunk_text=chunk_text.strip(),
+                    chunk_index=idx,
+                    subject_name=subject_name,
+                    subject_code=subject_code,
+                    document_type=document_type,
+                    priority=1.0,
+                ))
 
-        for section in sections:
-            section = section.strip()
-            if not section:
-                continue
-
-            for sub in self._split_by_tokens(section):
-                if sub.strip():
-                    chunks.append(Chunk(
-                        chunk_text=sub.strip(),
-                        chunk_index=idx,
-                        subject_name=subject_name,
-                        subject_code=subject_code,
-                        document_type=document_type,
-                        priority=1.0,
-                    ))
-                    idx += 1
-
-        logger.info("Notes chunked", total_chunks=len(chunks))
+        logger.info(
+            "Notes chunked (LangChain)",
+            total_chunks=len(chunks),
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+        )
         return chunks
 
 
@@ -147,7 +168,10 @@ class ExamChunker:
 
 
 class OCRAdaptedChunker(BaseChunker):
-    """Smaller chunks for OCR-derived text which may have noise."""
+    """
+    LangChain-based chunking optimized for OCR-derived text.
+    Smaller chunks (256 tokens) + higher overlap (64) to handle OCR noise.
+    """
 
     def __init__(self):
         super().__init__(chunk_size=256, overlap=64)
@@ -158,23 +182,37 @@ class OCRAdaptedChunker(BaseChunker):
         document_type: DocumentType = DocumentType.NOTES,
         **kwargs,
     ) -> List[Chunk]:
-        paragraphs = re.split(r"\n{2,}", text)
+        """
+        Chunk OCR text with smaller chunks and higher overlap.
+        Separator priority: Paragraphs → Lines → Words → Characters
+        """
+        # For OCR text, respect paragraph breaks but allow smaller chunks
+        separators = [
+            "\n\n",   # Paragraphs
+            "\n",     # Lines
+            " ",      # Words
+            "",       # Characters
+        ]
+
+        text_chunks = self._split_text(text, separators=separators)
+
         chunks = []
-        idx = 0
+        for idx, chunk_text in enumerate(text_chunks):
+            if chunk_text.strip():
+                chunks.append(Chunk(
+                    chunk_text=chunk_text.strip(),
+                    chunk_index=idx,
+                    document_type=document_type,
+                    priority=0.8,  # Slightly lower priority for OCR chunks
+                    metadata={"source": "ocr"},
+                ))
 
-        for para in paragraphs:
-            for sub in self._split_by_tokens(para.strip()):
-                if sub.strip():
-                    chunks.append(Chunk(
-                        chunk_text=sub.strip(),
-                        chunk_index=idx,
-                        document_type=document_type,
-                        priority=1.0,
-                        metadata={"source": "ocr"},
-                    ))
-                    idx += 1
-
-        logger.info("OCR document chunked", total_chunks=len(chunks))
+        logger.info(
+            "OCR document chunked (LangChain)",
+            total_chunks=len(chunks),
+            chunk_size=256,
+            overlap=64,
+        )
         return chunks
 
 
